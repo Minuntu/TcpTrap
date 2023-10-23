@@ -20,8 +20,10 @@ type Host struct {
 }
 
 type Target struct {
-	Host string
-	SSL  struct {
+	Host             string
+	PcapUseBackendIp bool   `yaml:"pcap_use_backend_ip"`
+	PcapFakeIp       string `yaml:"pcap_fake_ip"`
+	SSL              struct {
 		Enabled bool
 		Verify  bool
 	}

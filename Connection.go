@@ -2,25 +2,36 @@ package TcpTrap
 
 import (
 	"crypto/tls"
+	"github.com/charmbracelet/log"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"io"
-	"log"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
+// Connection is a just-enough TCP/IP stack proxy/recorder
+// It emulates the transport and network layer for capture
+// and can be set as a TLS (re)encryption proxy if configured,
+// saving unencrypted data in the capture
 type Connection struct {
-	proxy       *Proxy
-	remoteConn  net.Conn
-	backendConn net.Conn
-	remoteSeq   uint32
-	remoteAck   uint32
-	backendSeq  uint32
-	backendAck  uint32
+	proxy        *Proxy
+	remoteConn   net.Conn
+	backendConn  net.Conn
+	remoteSeq    uint32
+	remoteAck    uint32
+	backendSeq   uint32
+	backendAck   uint32
+	localAddr    net.Addr
+	closing      bool
+	readBytes    int64
+	writtenBytes int64
+	sync.WaitGroup
 }
 
+// HandleConnection Creates a connection and start proxying client to backend
 func HandleConnection(p *Proxy, conn net.Conn) {
 	var err error
 	connection := &Connection{
@@ -36,26 +47,49 @@ func HandleConnection(p *Proxy, conn net.Conn) {
 		connection.remoteConn.Close()
 		return
 	}
-	log.Printf("Proxying %s to %s", conn.RemoteAddr(), connection.backendConn.RemoteAddr())
+	if p.Host.Target.PcapUseBackendIp {
+		connection.localAddr = connection.backendConn.RemoteAddr()
+	} else if ip := net.ParseIP(p.Host.Target.PcapFakeIp); ip != nil {
+		port, _ := strconv.Atoi(p.SourcePort)
+		connection.localAddr = &net.TCPAddr{
+			IP:   ip,
+			Port: port,
+		}
+	} else {
+		connection.localAddr = connection.remoteConn.LocalAddr()
+	}
+
+	log.Info("opening connection", "remote_addr", conn.RemoteAddr(), "backend_addr", connection.backendConn.RemoteAddr())
 	connection.fakeTCPHandshake()
+	connection.Add(1)
 	go connection.Proxy(connection.remoteConn, connection.backendConn, true)
+	connection.Add(1)
 	go connection.Proxy(connection.backendConn, connection.remoteConn, false)
+	connection.Wait()
+	log.Info("closed connection", "remote_addr", conn.RemoteAddr(), "backend_addr", connection.backendConn.RemoteAddr(), "read", connection.readBytes, "written", connection.writtenBytes)
+
 }
 
+// Proxy Copy every packet from src to dst
+// Dumps packets to proxy's PCAP writer
 func (c *Connection) Proxy(src net.Conn, dst net.Conn, source bool) {
-	if source {
-		defer src.Close()
-		defer dst.Close()
-	}
+	defer c.Done()
+	// Close connections when source is done
+	defer src.Close()
+	defer dst.Close()
+	// Average MTU
 	buf := make([]byte, 1500)
 	var written int64
 	var err error
-	seqNumber := 1
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			seqNumber++
-			c.DumpPacket(src.RemoteAddr(), dst.RemoteAddr(), buf[0:nr], source)
+			// Dump packets depending on direction
+			if source {
+				c.DumpPacket(src.RemoteAddr(), c.localAddr, buf[0:nr], source)
+			} else {
+				c.DumpPacket(c.localAddr, dst.RemoteAddr(), buf[0:nr], source)
+			}
 			nw, ew := dst.Write(buf[0:nr])
 			if nw < 0 || nr < nw {
 				nw = 0
@@ -77,14 +111,22 @@ func (c *Connection) Proxy(src net.Conn, dst net.Conn, source bool) {
 			if er != io.EOF {
 				err = er
 			}
+			c.closing = true
 			break
 		}
 	}
-	if err != nil {
-		log.Println(err)
+	if err != nil && !c.closing {
+		log.Warn(err)
 	}
+	if source {
+		c.readBytes += written
+	} else {
+		c.writtenBytes += written
+	}
+	log.Debug("connection closed", "source", src.RemoteAddr().String(), "target", dst.RemoteAddr(), "transferred", written)
 }
 
+// getTcpIpBaseLayers Creates TCP/IP base layers for our packet dump
 func (c *Connection) getTcpIpBaseLayers(sourceAddress, targetAddress net.Addr) (SerializableNetworkLayer, *layers.TCP) {
 	sourceHost, sourcePortString, err := net.SplitHostPort(sourceAddress.String())
 	if err != nil {
@@ -130,14 +172,17 @@ func (c *Connection) getTcpIpBaseLayers(sourceAddress, targetAddress net.Addr) (
 	return ip, &tcp
 }
 
+// SerializableNetworkLayer combined interface acceptable by both SetNetworkLayerForChecksum and SerializeLayers
 type SerializableNetworkLayer interface {
 	gopacket.NetworkLayer
 	gopacket.SerializableLayer
 }
 
+// fakeTCPHandshake Creates a TCP handshake in the packet dump, setting up the rest of the connection
+// This also has the effect of recording SYN scan activity
 func (c *Connection) fakeTCPHandshake() {
 	buff := gopacket.NewSerializeBuffer()
-	ip, tcp := c.getTcpIpBaseLayers(c.remoteConn.RemoteAddr(), c.backendConn.RemoteAddr())
+	ip, tcp := c.getTcpIpBaseLayers(c.remoteConn.RemoteAddr(), c.localAddr)
 	tcp.SYN = true
 	tcp.Seq = c.remoteSeq
 	tcp.Ack = c.remoteSeq
@@ -159,7 +204,7 @@ func (c *Connection) fakeTCPHandshake() {
 	c.remoteSeq++
 
 	buff2 := gopacket.NewSerializeBuffer()
-	ip, tcp = c.getTcpIpBaseLayers(c.backendConn.RemoteAddr(), c.remoteConn.RemoteAddr())
+	ip, tcp = c.getTcpIpBaseLayers(c.localAddr, c.remoteConn.RemoteAddr())
 	tcp.SYN = true
 	tcp.ACK = true
 	tcp.Seq = c.backendSeq
@@ -181,7 +226,7 @@ func (c *Connection) fakeTCPHandshake() {
 	c.remoteAck++
 	c.backendSeq++
 	buff3 := gopacket.NewSerializeBuffer()
-	ip, tcp = c.getTcpIpBaseLayers(c.remoteConn.RemoteAddr(), c.backendConn.RemoteAddr())
+	ip, tcp = c.getTcpIpBaseLayers(c.remoteConn.RemoteAddr(), c.localAddr)
 	tcp.ACK = true
 	tcp.Seq = c.remoteSeq
 	tcp.Ack = c.remoteAck
@@ -204,6 +249,7 @@ func (c *Connection) fakeTCPHandshake() {
 	}
 }
 
+// DumpPacket writes a packet to the packet writer, increment our seq/ack according to sent/received data
 func (c *Connection) DumpPacket(sourceAddress, targetAddress net.Addr, buffer []byte, source bool) {
 	buff := gopacket.NewSerializeBuffer()
 	ip, tcp := c.getTcpIpBaseLayers(sourceAddress, targetAddress)

@@ -3,7 +3,6 @@ package main
 import (
 	"github.com/LeakIX/TcpTrap"
 	"gopkg.in/yaml.v2"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,7 +20,7 @@ func main() {
 	}
 	var proxies []*TcpTrap.Proxy
 
-	for proxyId, host := range config.Hosts {
+	for _, host := range config.Hosts {
 		pcapFile, err := os.Create(host.Pcap)
 		if err != nil {
 			panic(err)
@@ -31,7 +30,6 @@ func main() {
 			panic(err)
 		}
 		proxies = append(proxies, proxy)
-		log.Printf("Started proxy %s - %s -> %s", proxyId, host.Listen, host.Target.Host)
 	}
 	c := make(chan os.Signal)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)

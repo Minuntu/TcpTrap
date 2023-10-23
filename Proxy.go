@@ -6,13 +6,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"github.com/charmbracelet/log"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 	"io"
-	"log"
 	"math/big"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,8 @@ type Proxy struct {
 	packetWriter *pcapgo.Writer
 	PcapFile     io.WriteCloser
 	PacketChan   chan Packet
+	shuttingDown bool
+	sync.WaitGroup
 }
 
 func NewProxy(pcapFile io.WriteCloser, host Host) (*Proxy, error) {
@@ -89,22 +92,33 @@ func (p *Proxy) Listen() {
 	} else {
 		p.Listener, err = net.Listen("tcp", net.JoinHostPort(p.SourceHost, p.SourcePort))
 	}
-
+	log.Info("Started proxy", "local_addr", p.Listener.Addr().String(), "remote_addr", p.Host.Target.Host, "local_ssl", p.Host.SSL.Enabled, "remote_ssl", p.Host.Target.SSL.Enabled)
 	if err != nil {
 		panic(err)
 	}
 	for {
-		conn, err := p.Listener.Accept()
-		if err != nil {
-			log.Println(err)
-			break
+		if conn, err := p.Listener.Accept(); err != nil && p.shuttingDown {
+			// Accept error is exepected when shutting down
+			return
+		} else if err != nil {
+			log.Error(err)
+			return
+		} else {
+			p.Add(1)
+			go func() {
+				defer p.Done()
+				HandleConnection(p, conn)
+			}()
 		}
-		go HandleConnection(p, conn)
 	}
 }
 
 func (p *Proxy) Shutdown() {
+	log.Info("Shutting down proxy", "local_addr", p.Listener.Addr().String())
+	p.shuttingDown = true
 	p.Listener.Close()
+	// Wait for all connections to close
+	p.Wait()
 	for {
 		if len(p.PacketChan) == 0 {
 			break
@@ -112,6 +126,8 @@ func (p *Proxy) Shutdown() {
 		time.Sleep(time.Millisecond)
 	}
 	p.PcapFile.Close()
+	log.Info("Proxy terminated", "local_addr", p.Listener.Addr().String())
+
 }
 
 func (p *Proxy) SelfSignedCert() tls.Certificate {
